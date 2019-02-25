@@ -20,9 +20,11 @@ limitations under the License.
 
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/executor.h"
+#include "tensorflow/core/common_runtime/executor_factory.h"
 #include "tensorflow/core/common_runtime/graph_optimizer.h"
 #include "tensorflow/core/common_runtime/memory_types.h"
 #include "tensorflow/core/common_runtime/rendezvous_mgr.h"
+#include "tensorflow/core/framework/collective.h"
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/node_def.pb.h"
 #include "tensorflow/core/framework/node_def_util.h"
@@ -44,7 +46,11 @@ namespace tensorflow {
 
 // A few string constant used throughout this module.
 static constexpr const char* const kArgOp = FunctionLibraryDefinition::kArgOp;
+static constexpr const char* const kDeviceArgOp =
+    FunctionLibraryDefinition::kDeviceArgOp;
 static constexpr const char* const kRetOp = FunctionLibraryDefinition::kRetOp;
+static constexpr const char* const kDeviceRetOp =
+    FunctionLibraryDefinition::kDeviceRetOp;
 static constexpr const char* const kGradientOp =
     FunctionLibraryDefinition::kGradientOp;
 static constexpr const char* const kNodeLabel = "Func";
@@ -98,6 +104,10 @@ static Node* AddIdentity(Graph* g, Endpoint input) {
   NodeDef ndef;
   ndef.set_name(g->NewName(kNodeLabel));
   ndef.set_op("Identity");
+  // NOTE(skyewm): we explicitly set the device here to address a multi-GPU
+  // performance issue where this Identity would be placed alone on a GPU,
+  // causing unnecessary device traffic. See b/122483225 for details.
+  ndef.set_device(input.node->def().device());
   ndef.add_input(input.name());
   AddNodeAttr("T", BaseType(input.dtype()), &ndef);
   Status s;
@@ -135,6 +145,153 @@ static Node* AddRet(Graph* g, Endpoint input, int index) {
   TF_CHECK_OK(s);
   g->AddEdge(input.node, input.index, ret, 0);
   return ret;
+}
+
+// FunctionLibraryRuntime implementation that forwards all the function calls to
+// the base runtime implementation, and only overrides overlay lib in calls to
+// Instantiate (if caller doesn't provide its own overlay lib).
+//
+// When function library runtime (FunctionLibraryRuntimeImpl specifically)
+// instantiates function into a Graph object, it also creates an Executor for
+// it. That executor has a pointer to the function library runtime instance,
+// that is used to instantiate all nested function calls.
+//
+// If the original function was instantiated using overlay lib, we must preserve
+// that overlay lib in the executor's function library runtime.
+//
+// IMPORTANT: This runtime is intended for use only in executors created for
+// functions instantiated into a graph in FunctionLibraryRuntimeImpl.
+class FunctionLibraryRuntimeOverlay : public FunctionLibraryRuntime {
+ public:
+  FunctionLibraryRuntimeOverlay(
+      FunctionLibraryRuntime* base_flr,
+      const FunctionLibraryDefinition* overlay_lib_def)
+      : base_flr_(base_flr), overlay_lib_def_(overlay_lib_def) {}
+  ~FunctionLibraryRuntimeOverlay() override;
+
+  Status Instantiate(const string& function_name, AttrSlice attrs,
+                     const InstantiateOptions& options,
+                     Handle* handle) override;
+
+  Status ReleaseHandle(Handle handle) override;
+
+  const FunctionBody* GetFunctionBody(Handle h) override;
+
+  void Run(const Options& opts, Handle handle, gtl::ArraySlice<Tensor> args,
+           std::vector<Tensor>* rets, DoneCallback done) override;
+
+  void Run(const Options& opts, Handle handle, CallFrameInterface* call_frame,
+           DoneCallback done) override;
+
+  Status CreateKernel(const NodeDef& ndef, OpKernel** kernel) override;
+
+  bool IsStateful(const string& function_name) override;
+
+  const FunctionLibraryDefinition* GetFunctionLibraryDefinition()
+      const override;
+
+  Env* env() override;
+  Device* device() override;
+  const DeviceMgr* device_mgr() const override;
+
+  string DebugString(Handle handle) override;
+  int graph_def_version() override;
+
+  Status Clone(std::unique_ptr<FunctionLibraryDefinition>* out_lib_def,
+               std::unique_ptr<ProcessFunctionLibraryRuntime>* out_pflr,
+               FunctionLibraryRuntime** out_flr) override;
+
+ private:
+  FunctionLibraryRuntime* base_flr_;                  // not owned
+  const FunctionLibraryDefinition* overlay_lib_def_;  // not owned
+};
+
+FunctionLibraryRuntimeOverlay::~FunctionLibraryRuntimeOverlay() = default;
+
+Status FunctionLibraryRuntimeOverlay::Instantiate(
+    const string& function_name, AttrSlice attrs,
+    const InstantiateOptions& options, Handle* handle) {
+  // We automatically add overlay lib to all instantiations, if the caller
+  // doesn't provide its own override.
+  if (!options.overlay_lib && overlay_lib_def_) {
+    InstantiateOptions options_copy = options;
+    options_copy.overlay_lib = overlay_lib_def_;
+    return base_flr_->Instantiate(function_name, attrs, options_copy, handle);
+  } else {
+    return base_flr_->Instantiate(function_name, attrs, options, handle);
+  }
+}
+
+Status FunctionLibraryRuntimeOverlay::ReleaseHandle(Handle handle) {
+  return base_flr_->ReleaseHandle(handle);
+}
+
+const FunctionBody* FunctionLibraryRuntimeOverlay::GetFunctionBody(Handle h) {
+  return base_flr_->GetFunctionBody(h);
+}
+
+void FunctionLibraryRuntimeOverlay::Run(const Options& opts, Handle handle,
+                                        gtl::ArraySlice<Tensor> args,
+                                        std::vector<Tensor>* rets,
+                                        DoneCallback done) {
+  base_flr_->Run(opts, handle, args, rets, std::move(done));
+}
+
+void FunctionLibraryRuntimeOverlay::Run(const Options& opts, Handle handle,
+                                        CallFrameInterface* call_frame,
+                                        DoneCallback done) {
+  base_flr_->Run(opts, handle, call_frame, std::move(done));
+}
+
+Status FunctionLibraryRuntimeOverlay::CreateKernel(const NodeDef&, OpKernel**) {
+  // We don't have access base_lib_def_ in base function library runtime (aka
+  // FunctionLibraryRuntimeImpl), so to make sure we do not create kernel with
+  // wrong lib_def we just disable creation of new kernels through overlays.
+  //
+  // When we call Instantiate from the base runtime with overlay lib override,
+  // the base runtime implementation is responsible for correctly passing custom
+  // overlay lib to all kernel constructions.
+  return errors::Internal(
+      "Overlay function library runtime doesn't support kernel creation.");
+}
+
+bool FunctionLibraryRuntimeOverlay::IsStateful(const string& function_name) {
+  // Important: we do not forward lookup to the base FLR.
+  const OpDef* op_def;
+  const Status s = overlay_lib_def_->LookUpOpDef(function_name, &op_def);
+  return s.ok() && op_def->is_stateful();
+}
+
+Env* FunctionLibraryRuntimeOverlay::env() { return base_flr_->env(); }
+
+Device* FunctionLibraryRuntimeOverlay::device() { return base_flr_->device(); }
+
+const DeviceMgr* FunctionLibraryRuntimeOverlay::device_mgr() const {
+  return base_flr_->device_mgr();
+}
+
+const FunctionLibraryDefinition*
+FunctionLibraryRuntimeOverlay::GetFunctionLibraryDefinition() const {
+  return overlay_lib_def_ ? overlay_lib_def_
+                          : base_flr_->GetFunctionLibraryDefinition();
+}
+
+string FunctionLibraryRuntimeOverlay::DebugString(Handle handle) {
+  return base_flr_->DebugString(handle);
+}
+
+int FunctionLibraryRuntimeOverlay::graph_def_version() {
+  return base_flr_->graph_def_version();
+}
+
+Status FunctionLibraryRuntimeOverlay::Clone(
+    std::unique_ptr<FunctionLibraryDefinition>* out_lib_def,
+    std::unique_ptr<ProcessFunctionLibraryRuntime>* out_pflr,
+    FunctionLibraryRuntime** out_flr) {
+  // NOTE(ezhulenev): Cloned FunctionLibraryRuntime will be missing overlay lib,
+  // but that's ok because we anyway do not copy/clone instantiated items from
+  // the base FLR.
+  return base_flr_->Clone(out_lib_def, out_pflr, out_flr);
 }
 
 class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
@@ -208,19 +365,22 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
 
   // The instantiated and transformed function is encoded as a Graph
   // object, and an executor is created for the graph.
-  struct Item : public core::RefCounted {
-    bool invalidated = false;
+  struct Item {
+    uint64 instantiation_counter = 0;
     const Graph* graph = nullptr;                            // Owned by exec.
     const FunctionLibraryDefinition* overlay_lib = nullptr;  // Not owned.
     FunctionBody* func_graph = nullptr;
     Executor* exec = nullptr;
+    FunctionLibraryRuntimeOverlay* overlay_flr = nullptr;
+    string executor_type;
 
-    ~Item() override {
+    ~Item() {
       delete this->func_graph;
       delete this->exec;
+      delete this->overlay_flr;
     }
   };
-  std::unordered_map<Handle, Item*> items_ GUARDED_BY(mu_);
+  std::unordered_map<Handle, std::unique_ptr<Item>> items_ GUARDED_BY(mu_);
 
   ProcessFunctionLibraryRuntime* parent_ = nullptr;  // not owned.
 
@@ -230,8 +390,8 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
   Status FunctionDefToBody(const FunctionDef& fdef, AttrSlice attrs,
                            const FunctionLibraryDefinition* lib_def,
                            FunctionBody** fbody);
-  Status CreateItem(Handle handle, Item** item);
-  Status GetOrCreateItem(Handle handle, Item** item);
+  Status CreateItem(Item** item);
+  Status GetOrCreateItem(LocalHandle local_handle, Item** item);
   Status InstantiateSymbolicGradient(const NameAttrList& func,
                                      const FunctionLibraryDefinition* lib_def,
                                      FunctionBody** g_body);
@@ -239,7 +399,11 @@ class FunctionLibraryRuntimeImpl : public FunctionLibraryRuntime {
   AttrValueMap FixAttrs(const AttrSlice& attrs);
   void RunRemote(const Options& opts, Handle handle,
                  gtl::ArraySlice<Tensor> args, std::vector<Tensor>* rets,
-                 Executor::Args* exec_args, Item* item, DoneCallback done);
+                 Item* item, DoneCallback done);
+
+  void ExecutorArgsFromOptions(const FunctionLibraryRuntime::Options& run_opts,
+                               CallFrameInterface* frame,
+                               Executor::Args* exec_args);
 
   TF_DISALLOW_COPY_AND_ASSIGN(FunctionLibraryRuntimeImpl);
 };
@@ -284,9 +448,7 @@ FunctionLibraryRuntimeImpl::FunctionLibraryRuntimeImpl(
   }
 }
 
-FunctionLibraryRuntimeImpl::~FunctionLibraryRuntimeImpl() {
-  for (auto p : items_) p.second->Unref();
-}
+FunctionLibraryRuntimeImpl::~FunctionLibraryRuntimeImpl() {}
 
 // An asynchronous op kernel which executes an instantiated function
 // defined in a library.
@@ -295,7 +457,9 @@ class CallOp : public AsyncOpKernel {
   CallOp(FunctionLibraryRuntime::Handle handle, OpKernelConstruction* ctx)
       : AsyncOpKernel(ctx), handle_(handle) {}
 
-  ~CallOp() override {}
+  ~CallOp() override {
+    // TODO(iga): Release the cached handle_
+  }
 
   void ComputeAsync(OpKernelContext* ctx, DoneCallback done) override {
     FunctionLibraryRuntime* lib = ctx->function_library();
@@ -309,6 +473,7 @@ class CallOp : public AsyncOpKernel {
     opts.step_container = ctx->step_container();
     opts.stats_collector = ctx->stats_collector();
     opts.runner = ctx->runner();
+    opts.collective_executor = ctx->collective_executor();
     std::vector<Tensor> args;
     args.reserve(ctx->num_inputs());
     for (int i = 0; i < ctx->num_inputs(); ++i) {
@@ -345,9 +510,10 @@ const FunctionBody* FunctionLibraryRuntimeImpl::GetFunctionBody(Handle h) {
     return nullptr;
   }
 
-  mutex_lock l(mu_);
-  CHECK_EQ(1, items_.count(local_handle));
-  return items_[local_handle]->func_graph;
+  tf_shared_lock l(mu_);
+  auto iter = items_.find(local_handle);
+  CHECK(iter != items_.end());
+  return iter->second->func_graph;
 }
 
 Status FunctionLibraryRuntimeImpl::CreateKernel(const NodeDef& ndef,
@@ -398,12 +564,11 @@ Status FunctionLibraryRuntimeImpl::CreateKernel(
   // types.
   MemoryTypeVector input_memory_types;
   for (const auto& t : fbody->arg_types) {
-    input_memory_types.push_back(
-        (t == DT_INT32 || t == DT_RESOURCE) ? HOST_MEMORY : DEVICE_MEMORY);
+    input_memory_types.push_back(MTypeFromDType(t));
   }
   MemoryTypeVector output_memory_types;
   for (const auto& t : fbody->ret_types) {
-    output_memory_types.push_back(t == DT_INT32 ? HOST_MEMORY : DEVICE_MEMORY);
+    output_memory_types.push_back(MTypeFromDType(t));
   }
 
   // Constructs a CallOp kernel for running the instantiated function.
@@ -412,9 +577,8 @@ Status FunctionLibraryRuntimeImpl::CreateKernel(
       device_type, device_, device_->GetAllocator(AllocatorAttributes()), &ndef,
       &fbody->fdef.signature(), this, fbody->arg_types, input_memory_types,
       fbody->ret_types, output_memory_types, graph_def_version_, &s);
-  *kernel = new CallOp(handle, &construction);
-  if (!s.ok()) {
-    delete *kernel;
+  if (s.ok()) {
+    *kernel = new CallOp(handle, &construction);
   }
   return s;
 }
@@ -470,11 +634,20 @@ bool FunctionLibraryRuntimeImpl::IsLocalTarget(
     const InstantiateOptions& options) {
   if (device_ == nullptr) return true;
   if (options.target.empty()) return true;
+  if (options.is_multi_device_function) return false;
   Device* target_device;
   if (!device_mgr_->LookupDevice(options.target, &target_device).ok()) {
+    VLOG(1) << "Not instantiating function in FLR because failed to "
+            << "find device " << options.target << " in device manager";
     return false;
   }
-  return target_device == device_;
+  if (target_device != device_) {
+    VLOG(1) << "Not instantiating function in FLR because target device "
+            << options.target
+            << " is different from FLR's device: " << device_->DebugString();
+    return false;
+  }
+  return true;
 }
 
 Status FunctionLibraryRuntimeImpl::Instantiate(
@@ -490,30 +663,24 @@ Status FunctionLibraryRuntimeImpl::Instantiate(
   options_copy.target = device_name_;
   const string key = Canonicalize(function_name, attrs, options_copy);
 
-  Handle found_handle = kInvalidHandle;
   {
     mutex_lock l(mu_);
-    found_handle = parent_->GetHandle(key);
-    if (found_handle != kInvalidHandle) {
+    *handle = parent_->GetHandle(key);
+    if (*handle != kInvalidHandle) {
       FunctionLibraryRuntime::LocalHandle handle_on_device =
-          parent_->GetHandleOnDevice(device_name_, found_handle);
+          parent_->GetHandleOnDevice(device_name_, *handle);
       if (handle_on_device == kInvalidLocalHandle) {
         return errors::Internal("LocalHandle not found for handle ", *handle,
                                 ".");
       }
-      auto iter = items_.find(handle_on_device);
-      if (iter == items_.end()) {
+      auto item_handle = items_.find(handle_on_device);
+      if (item_handle == items_.end()) {
         return errors::Internal("LocalHandle ", handle_on_device,
-                                " for handle ", found_handle,
+                                " for handle ", *handle,
                                 " not found in items.");
       }
-      Item* item = iter->second;
-      if (!item->invalidated) {
-        *handle = found_handle;
-        return Status::OK();
-      }
-      // *item is invalidated. Fall through and instantiate the given
-      // function_name/attrs/option again.
+      ++item_handle->second->instantiation_counter;
+      return Status::OK();
     }
   }
 
@@ -543,35 +710,69 @@ Status FunctionLibraryRuntimeImpl::Instantiate(
     TF_RETURN_IF_ERROR(FunctionDefToBody(*fdef, attrs, lib_def, &fbody));
   }
 
+  LocalHandle local_handle;
   {
     mutex_lock l(mu_);
-    Handle found_handle_again = parent_->GetHandle(key);
-    if (found_handle_again != found_handle) {
+    *handle = parent_->GetHandle(key);
+    if (*handle != kInvalidHandle) {
       delete fbody;
-      *handle = found_handle_again;
+      local_handle = parent_->GetHandleOnDevice(device_name_, *handle);
+      ++items_[local_handle]->instantiation_counter;
     } else {
       *handle = parent_->AddHandle(key, device_name_, next_handle_);
       Item* item = new Item;
       item->func_graph = fbody;
       item->overlay_lib = options.overlay_lib;
-      items_.insert({next_handle_, item});
-      next_handle_++;
+      item->instantiation_counter = 1;
+      item->executor_type = ExecutorType(options, attrs);
+      if (options.overlay_lib) {
+        item->overlay_flr =
+            new FunctionLibraryRuntimeOverlay(this, options.overlay_lib);
+      }
+      local_handle = next_handle_++;
+      items_.emplace(local_handle, std::unique_ptr<Item>(item));
     }
   }
+
+  if (options.create_kernels_eagerly) {
+    Item* item;
+    TF_RETURN_IF_ERROR(GetOrCreateItem(local_handle, &item));
+  }
+
   return Status::OK();
 }
 
 Status FunctionLibraryRuntimeImpl::ReleaseHandle(Handle handle) {
-  if (!parent_->IsInstantiatedOnDevice(device_name_, handle)) {
+  LocalHandle h = parent_->GetHandleOnDevice(device_name_, handle);
+  if (h == kInvalidLocalHandle) {
     return parent_->ReleaseHandle(handle);
   }
-  LocalHandle h = parent_->GetHandleOnDevice(device_name_, handle);
-  CHECK_NE(h, kInvalidLocalHandle);
-  mutex_lock l(mu_);
-  CHECK_EQ(1, items_.count(h));
-  Item* item = items_[h];
-  item->invalidated = true;  // Reinstantiate later.
-  return Status::OK();
+
+  std::unique_ptr<Item> item_to_delete;
+  Status parent_status;
+  {
+    mutex_lock l(mu_);
+    auto it = items_.find(h);
+    if (it == items_.end()) {
+      return errors::Internal(
+          "Inconsistent FunctionLibraryRuntime. Expected to find an item for "
+          "handle ",
+          h, " but found none");
+    }
+    std::unique_ptr<Item>& item = it->second;
+    --item->instantiation_counter;
+    if (item->instantiation_counter == 0) {
+      // We don't simply erase h's item because that would trigger
+      // item destruction while holding mu_. Item destruction can
+      // trigger graph destruction. If the graph contains kernels like
+      // CallOp or PartitionCallOp, their destructors will release cached
+      // function handles, resulting in deadlock here.
+      item_to_delete = std::move(item);
+      items_.erase(h);
+      parent_status = parent_->RemoveHandle(handle);
+    }
+  }
+  return parent_status;
 }
 
 void DumpGraph(StringPiece label, const Graph* g) {
@@ -585,31 +786,53 @@ void DumpGraph(StringPiece label, const Graph* g) {
   }
 }
 
-void OptimizeGraph(FunctionLibraryRuntime* lib, std::unique_ptr<Graph>* g) {
+void OptimizeGraph(FunctionLibraryRuntime* lib, std::unique_ptr<Graph>* g,
+                   const GraphOptimizer::Options& graph_optimizer_options) {
   OptimizerOptions opts;
   opts.set_do_common_subexpression_elimination(true);
   opts.set_do_function_inlining(true);
   opts.set_do_constant_folding(true);
   GraphOptimizer optimizer(opts);
-  optimizer.Optimize(lib, lib->env(), lib->device(), g, /*shape_map=*/nullptr);
+  optimizer.Optimize(lib, lib->env(), lib->device(), g,
+                     graph_optimizer_options);
+}
+
+void OptimizeGraph(FunctionLibraryRuntime* lib, std::unique_ptr<Graph>* g) {
+  OptimizeGraph(lib, g, GraphOptimizer::Options());
 }
 
 namespace {
 // Removes all stateless nodes that do not contribute to a return
-// value from the function body.  Unlike `RemoveDeadNodes()`, which is
+// value from the function body. Unlike `RemoveDeadNodes()`, which is
 // triggered by `OptimizerOptions.do_function_inlining`, this pass
 // ignores the SINK node, from which (by definition) all nodes are
-// reverse reachable.
-void PruneFunctionBody(Graph* g) {
-  VLOG(2) << "Pruning function body";
+// reverse reachable, and preserves all nodes that are reachable from
+// control output nodes.
+//
+// TODO(ezhulenev, skyewm): Function body should not have special treatment of
+// stateful ops, graph should encode nodes that must execute with `control_ret`
+// and `control_output`.
+void PruneFunctionBody(const FunctionDef& fdef, Graph* g) {
+  VLOG(2) << "Pruning function body: function_name=" << fdef.signature().name();
+
+  // `control_ret` nodes must be always executed.
+  std::unordered_set<StringPiece, StringPieceHasher> control_ret_nodes;
+  for (const auto& control_ret : fdef.control_ret()) {
+    control_ret_nodes.insert(control_ret.second);
+  }
+
   std::unordered_set<const Node*> nodes;
   for (auto n : g->nodes()) {
     // NOTE(mrry): "_Retval" nodes are stateful, and so will be added
-    // to the seed set of `nodes`.
+    // to the seed set of `nodes`. "_Arg" nodes are also stateful, but we
+    // specifically exclude them as seeds, to avoid unconditionally executing
+    // unused argument nodes (e.g. in a function like `lambda x, y: y`).
     // TODO(mrry): Investigate whether the `n->IsControlFlow()` test is
     // still needed. It would be preferable to prune entire loops and/or
     // conditionals if they are not used in the graph.
-    if (n->IsControlFlow() || n->op_def().is_stateful()) {
+    if (n->IsControlFlow() ||
+        (n->op_def().is_stateful() && n->type_string() != kArgOp) ||
+        (control_ret_nodes.find(n->name()) != control_ret_nodes.end())) {
       nodes.insert(n);
     }
   }
@@ -620,13 +843,15 @@ void PruneFunctionBody(Graph* g) {
 }
 }  // namespace
 
-Status FunctionLibraryRuntimeImpl::CreateItem(Handle handle, Item** item) {
+Status FunctionLibraryRuntimeImpl::CreateItem(Item** item) {
   const FunctionBody* fbody;
   const FunctionLibraryDefinition* lib_def;
+  string executor_type;
   {
-    mutex_lock l(mu_);
+    tf_shared_lock l(mu_);
     fbody = (*item)->func_graph;
     lib_def = (*item)->overlay_lib;
+    executor_type = (*item)->executor_type;
   }
   if (!lib_def) {
     lib_def = base_lib_def_;
@@ -634,16 +859,19 @@ Status FunctionLibraryRuntimeImpl::CreateItem(Handle handle, Item** item) {
   std::unique_ptr<Graph> g(new Graph(lib_def));
   CopyGraph(*fbody->graph, g.get());
 
-  PruneFunctionBody(g.get());
+  PruneFunctionBody(fbody->fdef, g.get());
   optimizer_.Optimize(this, env(), device(), &g, /*shape_map=*/nullptr);
   TF_RETURN_IF_ERROR(EnsureMemoryTypes(DeviceType(device()->device_type()),
                                        device()->name(), g.get()));
 
-  // Creates an executor based on the g.  This must be done without
+  // Creates an executor based on the g. This must be done without
   // holding mu_ because create_kernel_ calls back into the library.
   LocalExecutorParams params;
   params.device = device_;
-  params.function_library = this;
+  params.function_library =
+      (*item)->overlay_flr
+          ? static_cast<FunctionLibraryRuntime*>((*item)->overlay_flr)
+          : static_cast<FunctionLibraryRuntime*>(this);
   if (lib_def == base_lib_def_) {
     params.create_kernel = create_kernel_;
   } else {
@@ -656,53 +884,66 @@ Status FunctionLibraryRuntimeImpl::CreateItem(Handle handle, Item** item) {
     DeleteNonCachedKernel(kernel);
   };
   Graph* graph = g.get();
-  Executor* exec;
-  TF_RETURN_IF_ERROR(NewLocalExecutor(params, std::move(g), &exec));
-
+  std::unique_ptr<Executor> exec;
+  TF_RETURN_IF_ERROR(NewExecutor(executor_type, params, std::move(g), &exec));
   {
     // Guard item since it is already inserted in items_.
     mutex_lock l(mu_);
-    if ((*item)->exec) {
-      delete exec;
-    } else {
+    if ((*item)->exec == nullptr) {
       (*item)->graph = graph;
-      (*item)->exec = exec;
+      (*item)->exec = exec.release();
     }
   }
   return Status::OK();
 }
 
-Status FunctionLibraryRuntimeImpl::GetOrCreateItem(Handle handle, Item** item) {
-  LocalHandle local_handle = parent_->GetHandleOnDevice(device_name_, handle);
+Status FunctionLibraryRuntimeImpl::GetOrCreateItem(LocalHandle local_handle,
+                                                   Item** item) {
   {
-    mutex_lock l(mu_);
-    if (items_.count(local_handle) == 0) {
-      return errors::NotFound("Function handle ", handle,
+    tf_shared_lock l(mu_);
+    auto iter = items_.find(local_handle);
+    if (iter == items_.end()) {
+      return errors::Internal("Local function handle ", local_handle,
                               " is not valid. Likely an internal error.");
     }
-    *item = items_[local_handle];
+    *item = iter->second.get();
     if ((*item)->exec != nullptr) {
       return Status::OK();
     }
   }
   // NOTE: We need to call CreateItem out of mu_ because creating an
   // executor needs to call CreateKernel.
-  return CreateItem(handle, item);
+  return CreateItem(item);
+}
+
+void FunctionLibraryRuntimeImpl::ExecutorArgsFromOptions(
+    const FunctionLibraryRuntime::Options& run_opts, CallFrameInterface* frame,
+    Executor::Args* exec_args) {
+  // Inherit the step_id from the caller.
+  exec_args->step_id = run_opts.step_id;
+  exec_args->rendezvous = run_opts.rendezvous;
+  exec_args->stats_collector = run_opts.stats_collector;
+  exec_args->cancellation_manager = run_opts.cancellation_manager;
+  exec_args->step_container = run_opts.step_container;
+  if (run_opts.runner) {
+    exec_args->runner = *run_opts.runner;
+  } else {
+    exec_args->runner = default_runner_;
+  }
+  exec_args->collective_executor = run_opts.collective_executor;
+  exec_args->call_frame = frame;
 }
 
 void FunctionLibraryRuntimeImpl::RunRemote(const Options& opts, Handle handle,
                                            gtl::ArraySlice<Tensor> args,
                                            std::vector<Tensor>* rets,
-                                           Executor::Args* exec_args,
                                            Item* item, DoneCallback done) {
-  DCHECK(exec_args->call_frame == nullptr);
   string target_device = parent_->GetDeviceName(handle);
   string source_device = opts.source_device;
   Rendezvous* rendezvous = opts.rendezvous;
   DeviceContext* device_context;
   Status s = parent_->GetDeviceContext(target_device, &device_context);
   if (!s.ok()) {
-    delete exec_args;
     done(s);
     return;
   }
@@ -710,7 +951,6 @@ void FunctionLibraryRuntimeImpl::RunRemote(const Options& opts, Handle handle,
   s = parent_->GetDeviceIncarnation(source_device, &src_incarnation);
   s.Update(parent_->GetDeviceIncarnation(target_device, &target_incarnation));
   if (!s.ok()) {
-    delete exec_args;
     done(s);
     return;
   }
@@ -718,32 +958,46 @@ void FunctionLibraryRuntimeImpl::RunRemote(const Options& opts, Handle handle,
   const FunctionBody* fbody = GetFunctionBody(handle);
   FunctionCallFrame* frame =
       new FunctionCallFrame(fbody->arg_types, fbody->ret_types);
-  exec_args->call_frame = frame;
-  if (!s.ok()) {
-    delete frame;
-    delete exec_args;
-    done(s);
-    return;
+  Executor::Args* exec_args = new Executor::Args;
+  ExecutorArgsFromOptions(opts, frame, exec_args);
+
+  std::vector<AllocatorAttributes> args_alloc_attrs, rets_alloc_attrs;
+  args_alloc_attrs.reserve(fbody->arg_types.size());
+  rets_alloc_attrs.reserve(fbody->ret_types.size());
+  // Note: Functions assume that int32's are always on host memory.
+  for (const auto& arg_type : fbody->arg_types) {
+    AllocatorAttributes arg_alloc_attrs;
+    if (MTypeFromDType(arg_type) == HOST_MEMORY) {
+      arg_alloc_attrs.set_on_host(true);
+    }
+    args_alloc_attrs.push_back(arg_alloc_attrs);
   }
+  for (const auto& ret_type : fbody->ret_types) {
+    AllocatorAttributes ret_alloc_attrs;
+    if (MTypeFromDType(ret_type) == HOST_MEMORY) {
+      ret_alloc_attrs.set_on_host(true);
+    }
+    rets_alloc_attrs.push_back(ret_alloc_attrs);
+  }
+
+  bool allow_dead_tensors = opts.allow_dead_tensors;
 
   // The ProcFLR sends the arguments to the function from the source_device to
   // the target_device. So here we receive those arguments. Similarly, when the
   // computation is done and stored in *rets, we send the return values back
   // to the source_device (caller) so that the ProcFLR can receive them later.
   std::vector<Tensor>* remote_args = new std::vector<Tensor>;
-  item->Ref();
   ProcessFunctionLibraryRuntime::ReceiveTensorsAsync(
       source_device, target_device, "arg_", src_incarnation, args.size(),
-      device_context, {}, rendezvous, remote_args,
+      device_context, args_alloc_attrs, rendezvous, remote_args,
       [frame, remote_args, item, source_device, target_device,
-       target_incarnation, rendezvous, device_context, rets, done,
-       exec_args](const Status& status) {
+       target_incarnation, rendezvous, device_context, rets, done, exec_args,
+       rets_alloc_attrs, allow_dead_tensors](const Status& status) {
         Status s = status;
         if (s.ok()) {
           s = frame->SetArgs(*remote_args);
         }
         if (!s.ok()) {
-          item->Unref();
           delete frame;
           delete remote_args;
           delete exec_args;
@@ -751,28 +1005,27 @@ void FunctionLibraryRuntimeImpl::RunRemote(const Options& opts, Handle handle,
           return;
         }
         item->exec->RunAsync(
-            *exec_args, [item, frame, rets, done, source_device, target_device,
-                         target_incarnation, rendezvous, device_context,
-                         remote_args, exec_args](const Status& status) {
-              core::ScopedUnref unref(item);
+            *exec_args,
+            [frame, rets, done, source_device, target_device,
+             target_incarnation, rendezvous, device_context, remote_args,
+             rets_alloc_attrs, allow_dead_tensors](const Status& status) {
               Status s = status;
               if (s.ok()) {
-                s = frame->ConsumeRetvals(rets);
+                s = frame->ConsumeRetvals(rets, allow_dead_tensors);
               }
               delete frame;
               if (!s.ok()) {
                 delete remote_args;
-                delete exec_args;
                 done(s);
                 return;
               }
               s = ProcessFunctionLibraryRuntime::SendTensors(
                   target_device, source_device, "ret_", target_incarnation,
-                  *rets, device_context, {}, rendezvous);
+                  *rets, device_context, rets_alloc_attrs, rendezvous);
               delete remote_args;
-              delete exec_args;
               done(s);
             });
+        delete exec_args;
       });
 }
 
@@ -795,64 +1048,54 @@ void FunctionLibraryRuntimeImpl::Run(const Options& opts, Handle handle,
     };
   }
 
+  LocalHandle local_handle = parent_->GetHandleOnDevice(device_name_, handle);
+  if (local_handle == kInvalidLocalHandle) {
+    parent_->Run(run_opts, handle, args, rets, done);
+    return;
+  }
+
   if (run_opts.runner == nullptr) {
     run_opts.runner = &default_runner_;
   }
   DCHECK(run_opts.runner != nullptr);
 
-  if (!parent_->IsInstantiatedOnDevice(device_name_, handle)) {
-    parent_->Run(run_opts, handle, args, rets, done);
-    return;
-  }
-
-  Executor::Args* exec_args = new Executor::Args;
-  // Inherit the step_id from the caller.
-  exec_args->step_id = run_opts.step_id;
-  exec_args->rendezvous = run_opts.rendezvous;
-  exec_args->stats_collector = run_opts.stats_collector;
-  exec_args->cancellation_manager = run_opts.cancellation_manager;
-  exec_args->step_container = run_opts.step_container;
-  exec_args->runner = *run_opts.runner;
-
   Item* item = nullptr;
-  Status s = GetOrCreateItem(handle, &item);
+  Status s = GetOrCreateItem(local_handle, &item);
   if (!s.ok()) {
-    delete exec_args;
     done(s);
     return;
   }
 
   if (run_opts.remote_execution) {
     // NOTE(mrry): `RunRemote()` will set `exec_args->call_frame` for us.
-    RunRemote(run_opts, handle, args, rets, exec_args, item, done);
+    RunRemote(run_opts, handle, args, rets, item, done);
     return;
   }
 
   const FunctionBody* fbody = GetFunctionBody(handle);
   FunctionCallFrame* frame =
       new FunctionCallFrame(fbody->arg_types, fbody->ret_types);
-  exec_args->call_frame = frame;
   s = frame->SetArgs(args);
   if (!s.ok()) {
     delete frame;
-    delete exec_args;
     done(s);
     return;
   }
 
-  item->Ref();
+  Executor::Args exec_args;
+  ExecutorArgsFromOptions(run_opts, frame, &exec_args);
+
+  bool allow_dead_tensors = run_opts.allow_dead_tensors;
   item->exec->RunAsync(
       // Executor args
-      *exec_args,
+      exec_args,
       // Done callback.
-      [item, frame, rets, done, exec_args](const Status& status) {
-        core::ScopedUnref unref(item);
+      [frame, rets, done, allow_dead_tensors](const Status& status) {
         Status s = status;
         if (s.ok()) {
-          s = frame->ConsumeRetvals(rets);
+          s = frame->ConsumeRetvals(rets, allow_dead_tensors);
         }
         delete frame;
-        delete exec_args;
         done(s);
       });
 }
@@ -864,8 +1107,8 @@ void FunctionLibraryRuntimeImpl::Run(const Options& opts, Handle handle,
     done(errors::Cancelled(""));
     return;
   }
-  if (!parent_->IsInstantiatedOnDevice(device_name_, handle) ||
-      opts.remote_execution) {
+  LocalHandle local_handle = parent_->GetHandleOnDevice(device_name_, handle);
+  if (local_handle == kInvalidLocalHandle || opts.remote_execution) {
     done(errors::Unimplemented("Remote calling with CallFrameInterface"));
     return;
   }
@@ -886,7 +1129,7 @@ void FunctionLibraryRuntimeImpl::Run(const Options& opts, Handle handle,
   }
 
   Item* item = nullptr;
-  Status s = GetOrCreateItem(handle, &item);
+  Status s = GetOrCreateItem(local_handle, &item);
   if (!s.ok()) {
     done(s);
     return;
@@ -896,30 +1139,9 @@ void FunctionLibraryRuntimeImpl::Run(const Options& opts, Handle handle,
   }
   DCHECK(run_opts.runner != nullptr);
 
-  Executor::Args* exec_args = new Executor::Args;
-  // Inherit the step_id from the caller.
-  exec_args->step_id = run_opts.step_id;
-  exec_args->rendezvous = run_opts.rendezvous;
-  exec_args->stats_collector = run_opts.stats_collector;
-  exec_args->cancellation_manager = run_opts.cancellation_manager;
-  exec_args->step_container = run_opts.step_container;
-  exec_args->runner = *run_opts.runner;
-  exec_args->call_frame = frame;
-
-  item->Ref();
-  item->exec->RunAsync(
-      // Executor args
-      *exec_args,
-      // Done callback.
-      std::bind(
-          [item, frame, exec_args](DoneCallback done,
-                                   // Start unbound arguments.
-                                   const Status& status) {
-            core::ScopedUnref unref(item);
-            delete exec_args;
-            done(status);
-          },
-          std::move(done), std::placeholders::_1));
+  Executor::Args exec_args;
+  ExecutorArgsFromOptions(run_opts, frame, &exec_args);
+  item->exec->RunAsync(exec_args, std::move(done));
 }
 
 bool FunctionLibraryRuntimeImpl::IsStateful(const string& func) {
@@ -930,7 +1152,8 @@ bool FunctionLibraryRuntimeImpl::IsStateful(const string& func) {
 
 string FunctionLibraryRuntimeImpl::DebugString(Handle handle) {
   Item* item = nullptr;
-  Status s = GetOrCreateItem(handle, &item);
+  LocalHandle local_handle = parent_->GetHandleOnDevice(device_name_, handle);
+  Status s = GetOrCreateItem(local_handle, &item);
   if (s.ok()) {
     return tensorflow::DebugString(item->graph);
   } else {
@@ -1182,6 +1405,10 @@ static bool ValidateInlining(const Node* node, const FunctionBody* fbody) {
   if (static_cast<size_t>(node->num_outputs()) != fbody->ret_nodes.size()) {
     return false;
   }
+  // TODO(ezhulenev): Currently common_runtime function inlining can't guarantee
+  // that all side-effectful ops will be executed after inlining. See Grappler
+  // function_optimizer for details. Unify all function inlining mechanism.
+  // Do not inline if `!fbody->control_ret_nodes.empty()`.
   for (int i = 0; i < node->num_inputs(); ++i) {
     if (node->input_type(i) != fbody->arg_types[i]) return false;
   }
@@ -1191,11 +1418,13 @@ static bool ValidateInlining(const Node* node, const FunctionBody* fbody) {
   return true;
 }
 
-// Given a "caller" in "graph", which is a function call of a function
+// Given a "caller" in graph "g", which is a function call of a function
 // to "fbody". Replaces the "caller" with fbody->graph and connects
-// edges properly.
+// edges properly. "override_device" specifies whether inlining should replace
+// explicitly specified devices inside fbody with the callee's device.
 void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
-                        Node* caller, const FunctionBody* fbody) {
+                        Node* caller, const FunctionBody* fbody,
+                        bool override_device) {
   if (!ValidateInlining(caller, fbody)) {
     LOG(WARNING) << "Inlining mismatch: " << caller->DebugString() << " vs. "
                  << DebugString(fbody->graph);
@@ -1212,6 +1441,7 @@ void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
     if (e->IsControlEdge()) {
       if (input_control_node == nullptr) {
         input_control_node = AddNoOp(g);
+        input_control_node->set_requested_device(caller->def().device());
       }
       g->AddControlEdge(e->src(), input_control_node);
     } else {
@@ -1230,7 +1460,15 @@ void InlineFunctionBody(const FunctionLibraryDefinition& flib_def, Graph* g,
   for (Node* n : fbody->graph->op_nodes()) {
     NodeDef ndef = n->def();
     ndef.set_name(strings::StrCat(caller->name(), "/", ndef.name()));
-    ndef.set_device(caller->def().device());
+    if (override_device || ndef.device().empty()) {
+      ndef.set_device(caller->def().device());
+    }
+    for (auto& attr : *ndef.mutable_attr()) {
+      if (attr.first == "_class") {
+        attr.second.set_s(
+            strings::StrCat(caller->name(), "/", attr.second.s()));
+      }
+    }
     Node* clone = g->AddNode(ndef, &s);
     TF_CHECK_OK(s);
     node_map[n->id()] = clone;
@@ -1410,6 +1648,13 @@ void ToGraphDef(const Graph* g, GraphDef* gdef, bool pretty) {
     for (const auto& attr : n->attrs()) {
       (*ndef->mutable_attr())[attr.first] = attr.second;
     }
+
+    if (!n->assigned_device_name().empty()) {
+      ndef->set_device(n->assigned_device_name());
+    } else {
+      ndef->set_device(n->requested_device());
+    }
+
     inputs.clear();
     inputs.resize(n->num_inputs());
     for (const Edge* e : n->in_edges()) {
@@ -1457,13 +1702,14 @@ FunctionBody::FunctionBody(const FunctionDef& f, DataTypeSlice arg_t,
       graph(g),
       arg_types(arg_t.begin(), arg_t.end()),
       ret_types(ret_t.begin(), ret_t.end()) {
+  // 1. Find regular Arg/Ret nodes.
   this->arg_nodes.resize(arg_types.size());
   this->ret_nodes.resize(ret_types.size());
   for (Node* n : this->graph->op_nodes()) {
     gtl::InlinedVector<Node*, 4>* node_vec;
-    if (n->type_string() == kRetOp) {
+    if (n->type_string() == kRetOp || n->type_string() == kDeviceRetOp) {
       node_vec = &this->ret_nodes;
-    } else if (n->type_string() == kArgOp) {
+    } else if (n->type_string() == kArgOp || n->type_string() == kDeviceArgOp) {
       node_vec = &this->arg_nodes;
     } else {
       continue;
@@ -1473,6 +1719,17 @@ FunctionBody::FunctionBody(const FunctionDef& f, DataTypeSlice arg_t,
     CHECK_LE(0, index);
     CHECK_LT(index, node_vec->size());
     (*node_vec)[index] = n;
+  }
+  // 2. Find ControlRet nodes that must be always executed.
+  std::unordered_set<StringPiece, StringPieceHasher> control_ret_node_names;
+  for (const auto& control_ret : fdef.control_ret()) {
+    control_ret_node_names.insert(control_ret.second);
+  }
+  this->control_ret_nodes.reserve(control_ret_node_names.size());
+  for (Node* n : this->graph->op_nodes()) {
+    if (control_ret_node_names.count(n->name()) > 0) {
+      this->control_ret_nodes.push_back(n);
+    }
   }
 }
 
@@ -1584,6 +1841,12 @@ FunctionBody* SymbolicGradientHelper::Compute() {
     g->RemoveNode(n);
   }
   gbody_->ret_types = fbody_->arg_types;
+  // TODO(apassos): use the right dtype for gradients of  resource variables
+  for (int i = 0; i < gbody_->ret_types.size(); ++i) {
+    if (gbody_->ret_types[i] == DT_RESOURCE) {
+      gbody_->ret_types[i] = DT_FLOAT;
+    }
+  }
   gbody_->ret_nodes.clear();
   // Add new return nodes to the function gradient body for each node
   // in 'x_grad_nodes'.

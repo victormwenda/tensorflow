@@ -34,23 +34,31 @@ bool CanBeLoopFused(const HloInstruction& hlo) {
          hlo.opcode() == HloOpcode::kConcatenate ||
          hlo.opcode() == HloOpcode::kDynamicSlice ||
          hlo.opcode() == HloOpcode::kDynamicUpdateSlice ||
-         hlo.opcode() == HloOpcode::kPad ||
+         hlo.opcode() == HloOpcode::kGather ||
+         hlo.opcode() == HloOpcode::kIota || hlo.opcode() == HloOpcode::kPad ||
          hlo.opcode() == HloOpcode::kReshape ||
          hlo.opcode() == HloOpcode::kReverse ||
          hlo.opcode() == HloOpcode::kSlice ||
          hlo.opcode() == HloOpcode::kTranspose;
 }
 
-bool IsMatrixVectorDot(const HloInstruction* hlo) {
+bool IsNonComplexMatrixVectorDot(const HloInstruction* hlo) {
   const Shape& hlo_shape = hlo->shape();
-  return hlo->opcode() == HloOpcode::kDot && hlo_shape.dimensions_size() == 2 &&
+  return !ShapeUtil::ElementIsComplex(hlo_shape) &&
+         hlo->opcode() == HloOpcode::kDot && hlo_shape.dimensions_size() == 2 &&
          (hlo_shape.dimensions(0) == 1 || hlo_shape.dimensions(1) == 1);
+}
+
+bool HasExactlyOneUse(const HloInstruction& hlo_instr) {
+  return hlo_instr.user_count() == 1 &&
+         absl::c_count(hlo_instr.users().front()->operands(), &hlo_instr) == 1;
 }
 
 bool CanBeOutputFused(const HloInstruction* producer,
                       const HloInstruction* consumer) {
-  return consumer->opcode() == HloOpcode::kAdd && IsMatrixVectorDot(producer) &&
-         producer->user_count() == 1;
+  return consumer->opcode() == HloOpcode::kAdd &&
+         IsNonComplexMatrixVectorDot(producer) &&
+         HasExactlyOneUse(*producer) == 1;
 }
 
 bool CanBeOutputFusedIntoSomeOperand(const HloInstruction* consumer) {
@@ -77,7 +85,7 @@ bool CpuInstructionFusion::ShouldFuse(HloInstruction* consumer,
   }
 
   if (!CanBeLoopFused(*producer)) {
-    VLOG(2) << "Producer is not fusile.";
+    VLOG(2) << "Producer is not fusible.";
     return false;
   }
 
@@ -139,7 +147,7 @@ bool CpuInstructionFusion::ShouldFuse(HloInstruction* consumer,
   }
 
   if (CanBeLoopFused(*consumer)) {
-    VLOG(2) << "Fusing: consumer is elementwise or fusile.";
+    VLOG(2) << "Fusing: consumer is elementwise or fusible.";
     return true;
   }
 

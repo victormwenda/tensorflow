@@ -93,13 +93,13 @@ Status SingleMachine::Provision() {
             strings::StrCat("Not able to parse GPU device name: ", dev.name()));
       }
       TfGpuId tf_gpu_id(parsed.id);
-      CudaGpuId cuda_gpu_id;
-      Status s = GpuIdManager::TfToCudaGpuId(tf_gpu_id, &cuda_gpu_id);
+      PlatformGpuId platform_gpu_id;
+      Status s = GpuIdManager::TfToPlatformGpuId(tf_gpu_id, &platform_gpu_id);
       if (!s.ok()) {
         return errors::Unavailable("Unknown TF GPU device with id ",
                                    tf_gpu_id.value(), ": ", s.ToString());
       }
-      attr = GetLocalGPUInfo(cuda_gpu_id);
+      attr = GetLocalGPUInfo(platform_gpu_id);
     } else if (dev.device_type().find("XLA") == string::npos) {
       // Filter out the fake XLA devices to avoid double counting the actual
       // hardware resources that are available.
@@ -227,14 +227,14 @@ Status SingleMachine::GetPeakMemoryUsage(
 
   device_peak_memory->clear();
   for (Device* device : devices) {
-    AllocatorStats stats;
     auto* allocator = device->GetAllocator(AllocatorAttributes());
     if (!allocator->TracksAllocationSizes()) {
       return Status(error::INVALID_ARGUMENT,
                     "Tracking allocation is not enabled.");
     }
-    allocator->GetStats(&stats);
-    (*device_peak_memory)[device->name()] = stats.max_bytes_in_use;
+    absl::optional<AllocatorStats> stats = allocator->GetStats();
+    (*device_peak_memory)[device->name()] =
+        (stats ? stats->peak_bytes_in_use : 0);
   }
 
   return Status::OK();
@@ -367,6 +367,15 @@ Status SingleMachine::ResetSession() {
     return errors::Unknown("Failed to create session");
   }
   coordinator_.reset(new Coordinator());
+
+  // Build the DeviceSet.
+  device_set_.reset(new DeviceSet);
+  const DeviceMgr* device_mgr;
+  TF_RETURN_IF_ERROR(session_->LocalDeviceManager(&device_mgr));
+  for (auto d : device_mgr->ListDevices()) {
+    device_set_->AddDevice(d);
+    // We currently don't care about the client device.
+  }
 
   return Status::OK();
 }
